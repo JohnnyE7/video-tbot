@@ -9,6 +9,7 @@ from aiogram.methods import (
     DeleteMessage,
     EditMessageReplyMarkup,
     EditMessageText,
+    SendAudio,
     SendMessage,
     SendVideo,
 )
@@ -16,7 +17,7 @@ from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, U
 
 from bot.config import Config
 from bot.handlers import create_router
-from bot.ytdlp import DownloadedVideo, Quality, VideoInfo, YtDlpError
+from bot.ytdlp import DownloadedAudio, DownloadedVideo, Quality, VideoInfo, YtDlpError
 
 USER = User(id=1, is_bot=False, first_name="Друг")
 CHAT = Chat(id=1, type="private")
@@ -52,6 +53,7 @@ class FakeYtDlp:
             description="Описание",
             duration=65,
             qualities=(Quality(1080, 90_000_000), Quality(720, 30_000_000), Quality(360, None)),
+            audio_size=3_000_000,
         )
         self.download_error = None
         self.downloads = []
@@ -66,6 +68,14 @@ class FakeYtDlp:
         path = directory / "video.mp4"
         path.write_bytes(b"video")
         return DownloadedVideo(path, 576, 1024, 65)
+
+    async def download_audio(self, url, directory: Path):
+        self.downloads.append((url, "audio"))
+        if self.download_error:
+            raise self.download_error
+        path = directory / "audio.m4a"
+        path.write_bytes(b"audio")
+        return DownloadedAudio(path, "Трек", "Автор", 65)
 
 
 class FlowTest(unittest.IsolatedAsyncioTestCase):
@@ -123,7 +133,8 @@ class FlowTest(unittest.IsolatedAsyncioTestCase):
         labels = [button.text for row in self.last_keyboard() for button in row]
         # 1080p does not fit the 50 MB limit of the cloud Bot API, so it isn't offered.
         self.assertEqual(
-            labels, ["✅ Заголовок", "⬜ Описание", "720p · ~30 МБ", "360p"]
+            labels,
+            ["✅ Заголовок", "⬜ Описание", "720p · ~30 МБ", "360p", "🎵 Только аудио · ~3 МБ"],
         )
 
         await self.press("720p")
@@ -160,8 +171,39 @@ class FlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2", self.calls(SendMessage)[0].text)
         self.assertEqual(self.calls(EditMessageText), [])
 
-    async def test_too_large_video_explains_limit(self):
-        self.ytdlp.info = VideoInfo("T", "", 60, (Quality(1080, 900_000_000),))
+    async def test_audio_is_sent_with_metadata_and_chosen_caption(self):
+        await self.send_link()
+        await self.press("Только аудио")
+        self.assertEqual(self.ytdlp.downloads, [(URL, "audio")])
+        self.assertEqual(self.calls(SendVideo), [])
+        audio = self.calls(SendAudio)[0]
+        self.assertEqual(audio.caption, "Заголовок")
+        self.assertEqual((audio.title, audio.performer, audio.duration), ("Трек", "Автор", 65))
+        self.assertEqual(audio.audio.filename, "Заголовок.m4a")
+        self.assertEqual(audio.reply_parameters.message_id, 10)
+        self.assertEqual(len(self.calls(DeleteMessage)), 1)
+
+    async def test_failed_audio_offers_menu_again(self):
+        await self.send_link()
+        self.ytdlp.download_error = YtDlpError("Сломалось")
+        await self.press("Только аудио")
+        self.assertEqual(self.calls(SendAudio), [])
+        self.assertIn("Сломалось", self.calls(EditMessageText)[-1].text)
+        self.assertTrue(self.last_keyboard())
+
+    async def test_too_large_video_still_offers_audio(self):
+        self.ytdlp.info = VideoInfo(
+            "T", "", 60, (Quality(1080, 900_000_000),), audio_size=5_000_000
+        )
+        await self.send_link()
+        self.assertIn("можно скачать аудио", self.calls(EditMessageText)[-1].text)
+        labels = [button.text for row in self.last_keyboard() for button in row]
+        self.assertEqual(labels, ["✅ Заголовок", "⬜ Описание", "🎵 Только аудио · ~5 МБ"])
+
+    async def test_too_large_video_and_audio_explains_limit(self):
+        self.ytdlp.info = VideoInfo(
+            "T", "", 60, (Quality(1080, 900_000_000),), audio_size=80_000_000
+        )
         await self.send_link()
         self.assertIn("слишком большое", self.calls(EditMessageText)[-1].text)
 
