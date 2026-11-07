@@ -17,9 +17,11 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     Message,
     ReplyParameters,
 )
+from aiogram.utils.formatting import ExpandableBlockQuote, Text, as_list
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import Config
@@ -29,6 +31,8 @@ from bot.ytdlp import BEST_AVAILABLE, Quality, VideoInfo, YtDlp, YtDlpError, for
 logger = logging.getLogger(__name__)
 
 CAPTION_LIMIT = 1024
+# Titles are short in practice; this keeps even a two-unit-per-character one within a caption.
+TITLE_LIMIT = 500
 # Telegram allows 4096 units, and an emoji takes two, so this always fits.
 TEXT_CHUNK = 2000
 UPLOAD_TIMEOUT = 60 * 60
@@ -66,22 +70,34 @@ class VideoRequest:
     in_progress: bool = False
 
 
-def build_text(title: str, description: str, include_title: bool, include_description: bool) -> str:
-    title = title if include_title else ""
+def build_caption(
+    title: str, description: str, include_title: bool, include_description: bool
+) -> tuple[dict, list[dict]]:
+    """Returns caption arguments and, if the description doesn't fit, follow-up messages.
+
+    The description goes into an expandable quote, which Telegram collapses when it's long.
+    """
+    title = title[:TITLE_LIMIT] if include_title else ""
     description = description if include_description else ""
     # TikTok's title is the start of its description, so showing both would repeat it.
-    if title and description.startswith(title.removesuffix("...")):
+    if description and description.startswith(title.removesuffix("...")):
         title = ""
-    return "\n\n".join(part for part in (title, description) if part)
 
+    parts = [title] if title else []
+    if description:
+        parts.append(ExpandableBlockQuote(description))
+    if not parts:
+        return {}, []
 
-def split_caption(text: str) -> tuple[str | None, list[str]]:
-    """Returns the video caption and, if the text doesn't fit into one, follow-up messages."""
-    if not text:
-        return None, []
-    if len(text.encode("utf-16-le")) // 2 <= CAPTION_LIMIT:
-        return text, []
-    return None, [text[start : start + TEXT_CHUNK] for start in range(0, len(text), TEXT_CHUNK)]
+    caption = as_list(*parts, sep="\n\n").as_caption_kwargs()
+    if len(caption["caption"].encode("utf-16-le")) // 2 <= CAPTION_LIMIT:
+        return caption, []
+
+    chunks = (description[i : i + TEXT_CHUNK] for i in range(0, len(description), TEXT_CHUNK))
+    return (
+        Text(title).as_caption_kwargs() if title else {},
+        [ExpandableBlockQuote(chunk.strip()).as_kwargs() for chunk in chunks if chunk.strip()],
+    )
 
 
 def quality_label(quality: Quality) -> str:
@@ -174,15 +190,18 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
             text = f"Видео не помещается в лимит Telegram, но можно скачать аудио.\n\n{text}"
         await status.edit_text(text, reply_markup=build_keyboard(request_id, request))
 
-    def caption_parts(request: VideoRequest) -> tuple[str | None, list[str]]:
-        return split_caption(
-            build_text(
-                request.info.title,
-                request.info.description,
-                request.include_title,
-                request.include_description,
-            )
+    def caption_parts(request: VideoRequest) -> tuple[dict, list[dict]]:
+        return build_caption(
+            request.info.title,
+            request.info.description,
+            request.include_title,
+            request.include_description,
         )
+
+    async def send_extra_messages(sent: Message, messages: list[dict]) -> None:
+        for message in messages:
+            # A preview of a link from the description would take up the space the quote saves.
+            await sent.reply(**message, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
     async def send_audio(status: Message, request: VideoRequest) -> None:
         caption, extra_messages = caption_parts(request)
@@ -193,7 +212,6 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
             sent = await status.bot.send_audio(
                 chat_id=status.chat.id,
                 audio=FSInputFile(audio.path, filename=audio_filename(request.info.title)),
-                caption=caption,
                 title=audio.title,
                 performer=audio.performer,
                 duration=audio.duration,
@@ -202,9 +220,9 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
                     allow_sending_without_reply=True,
                 ),
                 request_timeout=UPLOAD_TIMEOUT,
+                **caption,
             )
-        for part in extra_messages:
-            await sent.reply(part)
+        await send_extra_messages(sent, extra_messages)
 
     async def send_video(status: Message, request: VideoRequest, height: int) -> None:
         caption, extra_messages = caption_parts(request)
@@ -215,7 +233,6 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
             sent = await status.bot.send_video(
                 chat_id=status.chat.id,
                 video=FSInputFile(video.path),
-                caption=caption,
                 width=video.width,
                 height=video.height,
                 duration=video.duration,
@@ -225,9 +242,9 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
                     allow_sending_without_reply=True,
                 ),
                 request_timeout=UPLOAD_TIMEOUT,
+                **caption,
             )
-        for part in extra_messages:
-            await sent.reply(part)
+        await send_extra_messages(sent, extra_messages)
 
     @router.message(CommandStart())
     async def handle_start(message: Message) -> None:
