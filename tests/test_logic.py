@@ -1,0 +1,135 @@
+import unittest
+
+from aiogram.types import Chat, Message, MessageEntity
+
+from bot.handlers import build_text, split_caption
+from bot.links import extract_urls, is_supported
+from bot.ytdlp import Quality, YtDlpError, friendly_error, parse_info, parse_qualities
+
+
+class LinksTest(unittest.TestCase):
+    def test_supported_hosts(self):
+        for url in (
+            "https://youtu.be/abc",
+            "https://www.youtube.com/shorts/abc",
+            "https://m.youtube.com/watch?v=abc",
+            "https://vm.tiktok.com/abc/",
+            "https://www.instagram.com/reel/abc/",
+        ):
+            self.assertTrue(is_supported(url), url)
+
+    def test_rejected_urls(self):
+        for url in (
+            "https://nottiktok.com/abc",
+            "https://tiktok.com.evil.example/abc",
+            "file:///C:/Windows/win.ini",
+            "http://localhost:8081/",
+            "https://[broken",
+        ):
+            self.assertFalse(is_supported(url), url)
+
+    def test_extracts_plain_and_hidden_links(self):
+        text = "🔥 youtu.be/abc и вот тут"
+        message = Message(
+            message_id=1,
+            date=0,
+            chat=Chat(id=1, type="private"),
+            text=text,
+            entities=[
+                # Offsets are UTF-16: the emoji takes two units.
+                MessageEntity(type="url", offset=3, length=12),
+                MessageEntity(
+                    type="text_link", offset=16, length=3, url="https://www.tiktok.com/@a/video/1"
+                ),
+            ],
+        )
+        self.assertEqual(
+            extract_urls(message), ["https://youtu.be/abc", "https://www.tiktok.com/@a/video/1"]
+        )
+
+
+class QualitiesTest(unittest.TestCase):
+    def test_adds_audio_and_prefers_h264_for_estimate(self):
+        info = {
+            "duration": 10,
+            "formats": [
+                {"vcodec": "none", "acodec": "mp4a.40.2", "filesize": 1_000_000, "tbr": 128},
+                {"vcodec": "none", "acodec": "opus", "filesize": 9_000_000, "tbr": 160},
+                {"vcodec": "vp9", "acodec": "none", "width": 1920, "height": 1080,
+                 "filesize": 50_000_000, "tbr": 4000},
+                {"vcodec": "avc1.640028", "acodec": "none", "width": 1920, "height": 1080,
+                 "filesize": 20_000_000, "tbr": 3000},
+            ],
+        }
+        self.assertEqual(parse_qualities(info), (Quality(1080, 21_000_000),))
+
+    def test_vertical_video_is_named_by_short_side(self):
+        info = {"formats": [{"vcodec": "h264", "acodec": "aac", "width": 576, "height": 1024}]}
+        self.assertEqual(parse_qualities(info), (Quality(576, None),))
+
+    def test_estimates_from_bitrate_and_skips_drm(self):
+        info = {
+            "duration": 8,
+            "formats": [
+                {"vcodec": "h264", "acodec": "aac", "height": 720, "tbr": 1000},
+                {"vcodec": "h264", "acodec": "aac", "height": 1080, "has_drm": True},
+            ],
+        }
+        self.assertEqual(parse_qualities(info), (Quality(720, 1_000_000),))
+
+    def test_keeps_lowest_resolutions(self):
+        heights = (2160, 1440, 1080, 720, 480, 360, 240, 144)
+        info = {"formats": [{"vcodec": "h264", "acodec": "aac", "height": h} for h in heights]}
+        self.assertEqual(tuple(q.height for q in parse_qualities(info)), heights)
+
+    def test_playlist_uses_first_entry(self):
+        info = {"_type": "playlist", "entries": [None, {"title": "Первое", "formats": []}]}
+        self.assertEqual(parse_info(info).title, "Первое")
+
+    def test_live_is_rejected(self):
+        with self.assertRaises(YtDlpError):
+            parse_info({"title": "Эфир", "live_status": "is_live"})
+
+
+class TextTest(unittest.TestCase):
+    def test_respects_choices(self):
+        self.assertEqual(build_text("T", "D", True, True), "T\n\nD")
+        self.assertEqual(build_text("T", "D", True, False), "T")
+        self.assertEqual(build_text("T", "D", False, True), "D")
+        self.assertEqual(build_text("T", "D", False, False), "")
+
+    def test_drops_title_repeated_in_description(self):
+        self.assertEqual(build_text("Начало...", "Начало и конец", True, True), "Начало и конец")
+
+    def test_short_text_goes_to_caption(self):
+        self.assertEqual(split_caption("x" * 1024), ("x" * 1024, []))
+        self.assertEqual(split_caption(""), (None, []))
+
+    def test_emoji_count_towards_caption_limit(self):
+        caption, parts = split_caption("😀" * 600)
+        self.assertIsNone(caption)
+        self.assertEqual("".join(parts), "😀" * 600)
+
+    def test_long_text_is_split_without_loss(self):
+        text = "x" * 4500
+        caption, parts = split_caption(text)
+        self.assertIsNone(caption)
+        self.assertEqual("".join(parts), text)
+        self.assertTrue(all(len(part) <= 2000 for part in parts))
+
+
+class ErrorsTest(unittest.TestCase):
+    def test_maps_login_errors(self):
+        message = friendly_error("ERROR: [Instagram] abc: login required to view this")
+        self.assertIn("без входа", message)
+
+    def test_maps_playlist_and_profile_links(self):
+        message = friendly_error("ERROR: No suitable extractor found for URL https://x")
+        self.assertIn("конкретное видео", message)
+
+    def test_unknown_error_keeps_details(self):
+        self.assertIn("boom", friendly_error("WARNING: x\nERROR: boom"))
+
+
+if __name__ == "__main__":
+    unittest.main()
