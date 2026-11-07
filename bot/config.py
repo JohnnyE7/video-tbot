@@ -16,6 +16,7 @@ class Config:
     proxy: str | None = None
     max_concurrent_downloads: int = 2
     auto_update: bool = True
+    data_dir: str = "data"
 
     @property
     def upload_limit(self) -> int:
@@ -42,4 +43,5 @@ def load_config() -> Config:
         proxy=os.getenv("YTDLP_PROXY", "").strip() or None,
         max_concurrent_downloads=int(os.getenv("MAX_CONCURRENT_DOWNLOADS") or 2),
         auto_update=os.getenv("YTDLP_AUTO_UPDATE", "true").strip().lower() != "false",
+        data_dir=os.getenv("DATA_DIR", "").strip() or "data",
     )

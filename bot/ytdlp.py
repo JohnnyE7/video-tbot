@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import sys
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +15,8 @@ logger = logging.getLogger(__name__)
 PROBE_TIMEOUT = 120
 DOWNLOAD_TIMEOUT = 60 * 60
 UPDATE_TIMEOUT = 5 * 60
+PROBE_CACHE_TTL = 24 * 60 * 60
+PROBE_CACHE_SIZE = 200
 
 # 0 means "no explicit resolution": the site did not report any.
 BEST_AVAILABLE = 0
@@ -35,6 +39,8 @@ class VideoInfo:
     duration: int | None
     qualities: tuple[Quality, ...]
     audio_size: int | None = None
+    # Identifies the video itself: its links differ, for example by YouTube's share parameter.
+    video_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +149,7 @@ def parse_info(info: dict) -> VideoInfo:
         duration=int(duration) if duration else None,
         qualities=parse_qualities(info),
         audio_size=parse_audio_size(info),
+        video_key=f"{info.get('extractor_key')}:{info['id']}" if info.get("id") else None,
     )
 
 
@@ -172,6 +179,7 @@ def _child_env() -> dict[str, str]:
 class YtDlp:
     def __init__(self, config: Config) -> None:
         self._config = config
+        self._probes: OrderedDict[str, tuple[float, VideoInfo]] = OrderedDict()
 
     def _base_args(self) -> list[str]:
         args = [
@@ -212,10 +220,19 @@ class YtDlp:
         return stdout.decode("utf-8", "replace")
 
     async def probe(self, url: str) -> VideoInfo:
+        cached = self._probes.get(url)
+        if cached and time.monotonic() - cached[0] < PROBE_CACHE_TTL:
+            return cached[1]
+
         output = await self._run(
             [*self._base_args(), "--dump-single-json", "--", url], PROBE_TIMEOUT
         )
-        return parse_info(json.loads(output))
+        info = parse_info(json.loads(output))
+        self._probes[url] = (time.monotonic(), info)
+        self._probes.move_to_end(url)
+        while len(self._probes) > PROBE_CACHE_SIZE:
+            self._probes.popitem(last=False)
+        return info
 
     async def download(self, url: str, height: int, directory: Path) -> DownloadedVideo:
         # H.264 + AAC in MP4 is what plays inline on every Telegram client.

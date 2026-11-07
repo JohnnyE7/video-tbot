@@ -3,4 +3,5 @@
 __pycache__/
 *.pyc
 cookies.txt
+data/
 .DS_Store

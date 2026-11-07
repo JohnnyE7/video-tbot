@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
@@ -17,6 +17,7 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
     LinkPreviewOptions,
     Message,
     ReplyParameters,
@@ -26,6 +27,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import Config
 from bot.links import extract_urls, is_supported
+from bot.storage import Storage
 from bot.ytdlp import BEST_AVAILABLE, Quality, VideoInfo, YtDlp, YtDlpError, format_size
 
 logger = logging.getLogger(__name__)
@@ -151,7 +153,7 @@ def build_menu_text(info: VideoInfo) -> str:
     return "\n".join(lines)
 
 
-def create_router(config: Config, ytdlp: YtDlp) -> Router:
+def create_router(config: Config, ytdlp: YtDlp, storage: Storage) -> Router:
     router = Router()
     router.message.filter(F.chat.type == "private")
 
@@ -161,7 +163,7 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
     def is_allowed(user_id: int) -> bool:
         return user_id in config.allowed_user_ids
 
-    async def show_menu(status: Message, url: str, source_message_id: int) -> None:
+    async def show_menu(status: Message, url: str, source_message_id: int, user_id: int) -> None:
         try:
             info = await ytdlp.probe(url)
         except YtDlpError as error:
@@ -181,7 +183,16 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
             return
 
         request_id = uuid.uuid4().hex[:12]
-        request = VideoRequest(url, info, fitting, source_message_id, offer_audio)
+        settings = storage.load_settings(user_id)
+        request = VideoRequest(
+            url,
+            info,
+            fitting,
+            source_message_id,
+            offer_audio,
+            include_title=settings.get("title", True),
+            include_description=settings.get("description", False),
+        )
         requests[request_id] = request
         while len(requests) > MAX_PENDING_REQUESTS:
             requests.popitem(last=False)
@@ -203,48 +214,70 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
             # A preview of a link from the description would take up the space the quote saves.
             await sent.reply(**message, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
-    async def send_audio(status: Message, request: VideoRequest) -> None:
-        caption, extra_messages = caption_parts(request)
+    def send_args(status: Message, request: VideoRequest) -> dict:
+        caption, _ = caption_parts(request)
+        return {
+            "chat_id": status.chat.id,
+            "reply_parameters": ReplyParameters(
+                message_id=request.source_message_id,
+                allow_sending_without_reply=True,
+            ),
+            "request_timeout": UPLOAD_TIMEOUT,
+            **caption,
+        }
 
+    async def send_audio(
+        status: Message, request: VideoRequest, audio: InputFile | str, **attributes
+    ) -> Message:
+        return await status.bot.send_audio(audio=audio, **send_args(status, request), **attributes)
+
+    async def send_video(
+        status: Message, request: VideoRequest, video: InputFile | str, **attributes
+    ) -> Message:
+        return await status.bot.send_video(
+            video=video, supports_streaming=True, **send_args(status, request), **attributes
+        )
+
+    async def upload_audio(status: Message, request: VideoRequest) -> Message:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             audio = await ytdlp.download_audio(request.url, Path(directory))
             await status.edit_text("Отправляю в Telegram…")
-            sent = await status.bot.send_audio(
-                chat_id=status.chat.id,
-                audio=FSInputFile(audio.path, filename=audio_filename(request.info.title)),
+            return await send_audio(
+                status,
+                request,
+                FSInputFile(audio.path, filename=audio_filename(request.info.title)),
                 title=audio.title,
                 performer=audio.performer,
                 duration=audio.duration,
-                reply_parameters=ReplyParameters(
-                    message_id=request.source_message_id,
-                    allow_sending_without_reply=True,
-                ),
-                request_timeout=UPLOAD_TIMEOUT,
-                **caption,
             )
-        await send_extra_messages(sent, extra_messages)
 
-    async def send_video(status: Message, request: VideoRequest, height: int) -> None:
-        caption, extra_messages = caption_parts(request)
-
+    async def upload_video(status: Message, request: VideoRequest, height: int) -> Message:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             video = await ytdlp.download(request.url, height, Path(directory))
             await status.edit_text("Отправляю в Telegram…")
-            sent = await status.bot.send_video(
-                chat_id=status.chat.id,
-                video=FSInputFile(video.path),
+            return await send_video(
+                status,
+                request,
+                FSInputFile(video.path),
                 width=video.width,
                 height=video.height,
                 duration=video.duration,
-                supports_streaming=True,
-                reply_parameters=ReplyParameters(
-                    message_id=request.source_message_id,
-                    allow_sending_without_reply=True,
-                ),
-                request_timeout=UPLOAD_TIMEOUT,
-                **caption,
             )
-        await send_extra_messages(sent, extra_messages)
+
+    async def resend(
+        status: Message, request: VideoRequest, variant: str, send: Callable[..., Awaitable[Message]]
+    ) -> Message | None:
+        """Telegram keeps every file it has received, so sending it again takes no download."""
+        video_key = request.info.video_key or request.url
+        file_id = storage.get_file_id(video_key, variant)
+        if file_id is None:
+            return None
+        try:
+            return await send(status, request, file_id)
+        except TelegramBadRequest as error:
+            logger.warning("Cached file of %s was refused: %s", request.url, error)
+            storage.forget_file_id(video_key, variant)
+            return None
 
     @router.message(CommandStart())
     async def handle_start(message: Message) -> None:
@@ -273,7 +306,7 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
         statuses = [await message.reply("Получаю информацию о видео…") for _ in supported]
         await asyncio.gather(
             *(
-                show_menu(status, url, message.message_id)
+                show_menu(status, url, message.message_id, message.from_user.id)
                 for status, url in zip(statuses, supported)
             )
         )
@@ -290,8 +323,10 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
 
         if callback_data.field == "title":
             request.include_title = not request.include_title
+            storage.save_setting(callback.from_user.id, "title", request.include_title)
         else:
             request.include_description = not request.include_description
+            storage.save_setting(callback.from_user.id, "description", request.include_description)
         await callback.message.edit_reply_markup(
             reply_markup=build_keyboard(callback_data.request_id, request)
         )
@@ -302,19 +337,25 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
         await deliver(
             callback,
             callback_data.request_id,
+            str(callback_data.height),
             "Скачиваю видео…",
-            lambda status, request: send_video(status, request, callback_data.height),
+            send_video,
+            lambda status, request: upload_video(status, request, callback_data.height),
         )
 
     @router.callback_query(AudioCallback.filter())
     async def handle_audio(callback: CallbackQuery, callback_data: AudioCallback) -> None:
-        await deliver(callback, callback_data.request_id, "Скачиваю аудио…", send_audio)
+        await deliver(
+            callback, callback_data.request_id, "audio", "Скачиваю аудио…", send_audio, upload_audio
+        )
 
     async def deliver(
         callback: CallbackQuery,
         request_id: str,
+        variant: str,
         progress_text: str,
-        send: Callable[[Message, VideoRequest], Awaitable[None]],
+        send: Callable[..., Awaitable[Message]],
+        upload: Callable[[Message, VideoRequest], Awaitable[Message]],
     ) -> None:
         request = requests.get(request_id)
         if request is None or not is_allowed(callback.from_user.id):
@@ -328,10 +369,17 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
         await callback.answer()
         status = callback.message
         try:
-            await status.edit_text("В очереди…")
-            async with download_slots:
-                await status.edit_text(progress_text)
-                await send(status, request)
+            sent = await resend(status, request, variant, send)
+            if sent is None:
+                await status.edit_text("В очереди…")
+                async with download_slots:
+                    await status.edit_text(progress_text)
+                    sent = await upload(status, request)
+            # A silent video comes back as an animation, which can't be sent as a video again.
+            media = sent.video or sent.audio
+            if media:
+                storage.save_file_id(request.info.video_key or request.url, variant, media.file_id)
+            await send_extra_messages(sent, caption_parts(request)[1])
         except (YtDlpError, TelegramAPIError) as error:
             logger.warning("Failed to deliver %s: %s", request.url, error)
             message = str(error) if isinstance(error, YtDlpError) else "Telegram не принял файл."

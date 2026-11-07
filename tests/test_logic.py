@@ -1,11 +1,20 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from aiogram.types import Chat, Message, MessageEntity
 
+from bot.config import Config
 from bot.handlers import audio_filename, build_caption
 from bot.links import extract_urls, is_supported
+from bot.storage import Storage
 from bot.ytdlp import (
+    PROBE_CACHE_SIZE,
+    PROBE_CACHE_TTL,
     Quality,
+    YtDlp,
     YtDlpError,
     friendly_error,
     parse_audio_size,
@@ -109,6 +118,76 @@ class QualitiesTest(unittest.TestCase):
     def test_live_is_rejected(self):
         with self.assertRaises(YtDlpError):
             parse_info({"title": "Эфир", "live_status": "is_live"})
+
+    def test_video_key_identifies_video_on_its_site(self):
+        info = {"extractor_key": "Youtube", "id": "abc", "formats": []}
+        self.assertEqual(parse_info(info).video_key, "Youtube:abc")
+        self.assertIsNone(parse_info({"formats": []}).video_key)
+
+
+class ProbeCacheTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.ytdlp = YtDlp(Config(bot_token="1:token", allowed_user_ids=frozenset()))
+        self.run_mock = AsyncMock(return_value=json.dumps({"title": "T", "formats": []}))
+        self.ytdlp._run = self.run_mock
+
+    async def test_repeated_link_is_not_probed_again(self):
+        first = await self.ytdlp.probe("https://youtu.be/a")
+        self.assertIs(await self.ytdlp.probe("https://youtu.be/a"), first)
+        self.assertEqual(self.run_mock.await_count, 1)
+
+        await self.ytdlp.probe("https://youtu.be/b")
+        self.assertEqual(self.run_mock.await_count, 2)
+
+    async def test_entry_expires(self):
+        with patch("bot.ytdlp.time.monotonic", return_value=1000):
+            await self.ytdlp.probe("https://youtu.be/a")
+        with patch("bot.ytdlp.time.monotonic", return_value=1000 + PROBE_CACHE_TTL):
+            await self.ytdlp.probe("https://youtu.be/a")
+        self.assertEqual(self.run_mock.await_count, 2)
+
+    async def test_failure_is_not_cached(self):
+        self.run_mock.side_effect = [YtDlpError("Сломалось"), json.dumps({"title": "T"})]
+        with self.assertRaises(YtDlpError):
+            await self.ytdlp.probe("https://youtu.be/a")
+        self.assertEqual((await self.ytdlp.probe("https://youtu.be/a")).title, "T")
+
+    async def test_oldest_entries_are_evicted(self):
+        for index in range(PROBE_CACHE_SIZE + 1):
+            await self.ytdlp.probe(f"https://youtu.be/{index}")
+        self.assertEqual(len(self.ytdlp._probes), PROBE_CACHE_SIZE)
+        self.assertNotIn("https://youtu.be/0", self.ytdlp._probes)
+
+
+class StorageTest(unittest.TestCase):
+    def test_data_survives_reopening(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            path = Path(directory) / "bot.sqlite3"
+            storage = Storage(path)
+            storage.save_setting(1, "title", False)
+            storage.save_file_id("Youtube:a", "720", "file")
+            storage.close()
+
+            storage = Storage(path)
+            self.addCleanup(storage.close)
+            self.assertEqual(storage.load_settings(1), {"title": False})
+            self.assertEqual(storage.get_file_id("Youtube:a", "720"), "file")
+
+    def test_replaces_and_forgets(self):
+        storage = Storage(":memory:")
+        self.addCleanup(storage.close)
+        self.assertEqual(storage.load_settings(1), {})
+        storage.save_setting(1, "title", False)
+        storage.save_setting(1, "title", True)
+        self.assertEqual(storage.load_settings(1), {"title": True})
+
+        storage.save_file_id("k", "720", "old")
+        storage.save_file_id("k", "720", "new")
+        storage.save_file_id("k", "audio", "track")
+        self.assertEqual(storage.get_file_id("k", "720"), "new")
+        storage.forget_file_id("k", "720")
+        self.assertIsNone(storage.get_file_id("k", "720"))
+        self.assertEqual(storage.get_file_id("k", "audio"), "track")
 
 
 class CaptionTest(unittest.TestCase):
