@@ -151,7 +151,20 @@ class FlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("⬜ Заголовок", self.calls(EditMessageReplyMarkup)[-1].reply_markup.inline_keyboard[0][0].text)
         await self.press("Описание")
         await self.press("360p")
-        self.assertEqual(self.calls(SendVideo)[0].caption, "Описание")
+        video = self.calls(SendVideo)[0]
+        self.assertEqual(video.caption, "Описание")
+        self.assertEqual(video.caption_entities[0].type, "expandable_blockquote")
+
+    async def test_long_description_follows_video_as_quotes_without_previews(self):
+        self.ytdlp.info = VideoInfo("Заголовок", "x" * 3000, 60, (Quality(360, None),))
+        await self.send_link()
+        await self.press("Описание")
+        await self.press("360p")
+        self.assertEqual(self.calls(SendVideo)[0].caption, "Заголовок")
+        parts = [call for call in self.calls(SendMessage) if call.entities]
+        self.assertEqual("".join(part.text for part in parts), "x" * 3000)
+        self.assertTrue(all(part.entities[0].type == "expandable_blockquote" for part in parts))
+        self.assertTrue(all(part.link_preview_options.is_disabled for part in parts))
 
     async def test_failed_download_offers_menu_again(self):
         await self.send_link()

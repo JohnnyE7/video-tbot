@@ -2,7 +2,7 @@ import unittest
 
 from aiogram.types import Chat, Message, MessageEntity
 
-from bot.handlers import audio_filename, build_text, split_caption
+from bot.handlers import audio_filename, build_caption
 from bot.links import extract_urls, is_supported
 from bot.ytdlp import (
     Quality,
@@ -111,31 +111,62 @@ class QualitiesTest(unittest.TestCase):
             parse_info({"title": "Эфир", "live_status": "is_live"})
 
 
-class TextTest(unittest.TestCase):
+class CaptionTest(unittest.TestCase):
+    def assert_quote(self, entities, text, quoted):
+        self.assertEqual(len(entities), 1)
+        entity = entities[0]
+        self.assertEqual(entity.type, "expandable_blockquote")
+        self.assertEqual(entity.extract_from(text), quoted)
+
     def test_respects_choices(self):
-        self.assertEqual(build_text("T", "D", True, True), "T\n\nD")
-        self.assertEqual(build_text("T", "D", True, False), "T")
-        self.assertEqual(build_text("T", "D", False, True), "D")
-        self.assertEqual(build_text("T", "D", False, False), "")
+        self.assertEqual(build_caption("T", "D", False, False), ({}, []))
+        caption, extra = build_caption("T", "D", True, False)
+        self.assertEqual((caption["caption"], caption["caption_entities"], extra), ("T", [], []))
+        caption, extra = build_caption("T", "D", False, True)
+        self.assertEqual((caption["caption"], extra), ("D", []))
+        self.assert_quote(caption["caption_entities"], "D", "D")
+
+    def test_only_description_is_quoted(self):
+        caption, extra = build_caption("😀 Заголовок", "Описание 😀", True, True)
+        self.assertEqual(caption["caption"], "😀 Заголовок\n\nОписание 😀")
+        self.assert_quote(caption["caption_entities"], caption["caption"], "Описание 😀")
+        self.assertEqual(extra, [])
 
     def test_drops_title_repeated_in_description(self):
-        self.assertEqual(build_text("Начало...", "Начало и конец", True, True), "Начало и конец")
+        caption, _ = build_caption("Начало...", "Начало и конец", True, True)
+        self.assertEqual(caption["caption"], "Начало и конец")
 
-    def test_short_text_goes_to_caption(self):
-        self.assertEqual(split_caption("x" * 1024), ("x" * 1024, []))
-        self.assertEqual(split_caption(""), (None, []))
+    def test_keeps_title_when_description_is_empty(self):
+        caption, _ = build_caption("...", "", True, True)
+        self.assertEqual(caption["caption"], "...")
+
+    def test_caption_limit_includes_title(self):
+        caption, extra = build_caption("T" * 10, "x" * 1012, True, True)
+        self.assertEqual(len(caption["caption"]), 1024)
+        self.assertEqual(extra, [])
+
+        caption, extra = build_caption("T" * 10, "x" * 1013, True, True)
+        self.assertEqual((caption["caption"], caption["caption_entities"]), ("T" * 10, []))
+        self.assertEqual(len(extra), 1)
 
     def test_emoji_count_towards_caption_limit(self):
-        caption, parts = split_caption("😀" * 600)
-        self.assertIsNone(caption)
-        self.assertEqual("".join(parts), "😀" * 600)
+        caption, extra = build_caption("", "😀" * 600, False, True)
+        self.assertEqual(caption, {})
+        self.assertEqual("".join(part["text"] for part in extra), "😀" * 600)
 
-    def test_long_text_is_split_without_loss(self):
-        text = "x" * 4500
-        caption, parts = split_caption(text)
-        self.assertIsNone(caption)
-        self.assertEqual("".join(parts), text)
-        self.assertTrue(all(len(part) <= 2000 for part in parts))
+    def test_long_description_is_split_into_quotes_without_loss(self):
+        description = "x" * 4500
+        caption, extra = build_caption("T", description, True, True)
+        self.assertEqual(caption["caption"], "T")
+        self.assertEqual("".join(part["text"] for part in extra), description)
+        for part in extra:
+            self.assertLessEqual(len(part["text"]), 2000)
+            self.assert_quote(part["entities"], part["text"], part["text"])
+
+    def test_very_long_title_still_fits_caption(self):
+        caption, extra = build_caption("😀" * 2000, "", True, False)
+        self.assertLessEqual(len(caption["caption"].encode("utf-16-le")) // 2, 1024)
+        self.assertEqual(extra, [])
 
 
 class AudioFilenameTest(unittest.TestCase):
