@@ -34,6 +34,7 @@ class VideoInfo:
     description: str
     duration: int | None
     qualities: tuple[Quality, ...]
+    audio_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,14 @@ class DownloadedVideo:
     path: Path
     width: int | None
     height: int | None
+    duration: int | None
+
+
+@dataclass(frozen=True)
+class DownloadedAudio:
+    path: Path
+    title: str | None
+    performer: str | None
     duration: int | None
 
 
@@ -67,20 +76,33 @@ def _is_h264(fmt: dict) -> bool:
     return (fmt.get("vcodec") or "").startswith(("avc", "h264"))
 
 
-def parse_qualities(info: dict) -> tuple[Quality, ...]:
-    """Lists the available resolutions, best first, with sizes where they can be estimated."""
-    duration = info.get("duration")
-    formats = [fmt for fmt in info.get("formats") or [] if not fmt.get("has_drm")]
+def _usable_formats(info: dict) -> list[dict]:
+    return [fmt for fmt in info.get("formats") or [] if not fmt.get("has_drm")]
 
+
+def _best_audio(formats: list[dict]) -> dict | None:
     audio_only = [
         fmt for fmt in formats if fmt.get("vcodec") == "none" and fmt.get("acodec") != "none"
     ]
     # Mirrors the "acodec:aac" preference of the download selector.
-    best_audio = max(
+    return max(
         audio_only,
         key=lambda fmt: ((fmt.get("acodec") or "").startswith("mp4a"), _bitrate(fmt)),
         default=None,
     )
+
+
+def parse_audio_size(info: dict) -> int | None:
+    """Sites like TikTok have no separate audio stream, so its size stays unknown."""
+    best_audio = _best_audio(_usable_formats(info))
+    return _estimate_size(best_audio, info.get("duration")) if best_audio else None
+
+
+def parse_qualities(info: dict) -> tuple[Quality, ...]:
+    """Lists the available resolutions, best first, with sizes where they can be estimated."""
+    duration = info.get("duration")
+    formats = _usable_formats(info)
+    best_audio = _best_audio(formats)
 
     # Mirrors the "vcodec:h264" preference, so the estimate matches what gets downloaded.
     best_by_height: dict[int, dict] = {}
@@ -120,6 +142,7 @@ def parse_info(info: dict) -> VideoInfo:
         description=(info.get("description") or "").strip(),
         duration=int(duration) if duration else None,
         qualities=parse_qualities(info),
+        audio_size=parse_audio_size(info),
     )
 
 
@@ -130,6 +153,8 @@ def friendly_error(stderr: str) -> str:
 
     if "no suitable extractor" in lowered:
         return "Нужна ссылка на конкретное видео, а не на плейлист или профиль."
+    if "unable to obtain file audio codec" in lowered:
+        return "В этом видео нет звука."
     if any(word in lowered for word in ("private", "login", "log in", "sign in", "cookies")):
         return "Видео недоступно без входа: оно закрытое или площадка требует cookies."
     if any(word in lowered for word in ("no video", "no formats", "requested format")):
@@ -193,15 +218,16 @@ class YtDlp:
         return parse_info(json.loads(output))
 
     async def download(self, url: str, height: int, directory: Path) -> DownloadedVideo:
-        limit = self._config.upload_limit
         # H.264 + AAC in MP4 is what plays inline on every Telegram client.
         sort = "vcodec:h264,acodec:aac,ext:mp4:m4a"
         if height != BEST_AVAILABLE:
             sort = f"res:{height},{sort}"
 
-        output = await self._run(
+        path = directory / "video.mp4"
+        metadata = await self._fetch(
+            url,
+            path,
             [
-                *self._base_args(),
                 "--format", "bv*+ba/b",
                 "--format-sort", sort,
                 "--merge-output-format", "mp4",
@@ -209,35 +235,68 @@ class YtDlp:
                 # Moves the index to the start of the file so playback starts immediately.
                 "--postprocessor-args", "Merger+ffmpeg:-movflags +faststart",
                 "--postprocessor-args", "VideoRemuxer+ffmpeg:-movflags +faststart",
+            ],
+        )
+        return DownloadedVideo(
+            path=path,
+            width=metadata.get("width"),
+            height=metadata.get("height"),
+            duration=_whole_seconds(metadata),
+        )
+
+    async def download_audio(self, url: str, directory: Path) -> DownloadedAudio:
+        path = directory / "audio.m4a"
+        metadata = await self._fetch(
+            url,
+            path,
+            [
+                "--format", "ba/b",
+                "--format-sort", "acodec:aac",
+                # Telegram's audio player takes MP3 and M4A; AAC sources are copied as is.
+                "--extract-audio",
+                "--audio-format", "m4a",
+                "--audio-quality", "0",
+            ],
+        )
+        return DownloadedAudio(
+            path=path,
+            title=metadata.get("title"),
+            performer=metadata.get("uploader"),
+            duration=_whole_seconds(metadata),
+        )
+
+    async def _fetch(self, url: str, path: Path, format_args: list[str]) -> dict:
+        limit = self._config.upload_limit
+        output = await self._run(
+            [
+                *self._base_args(),
+                *format_args,
                 "--max-filesize", str(limit),
-                "--paths", str(directory),
-                "--output", "video.%(ext)s",
-                "--print", "after_move:%(.{width,height,duration})j",
+                "--paths", str(path.parent),
+                "--output", f"{path.stem}.%(ext)s",
+                "--print", "after_move:%(.{width,height,duration,title,uploader})j",
                 "--",
                 url,
             ],
             DOWNLOAD_TIMEOUT,
         )
 
-        path = directory / "video.mp4"
         if not path.exists():
             # yt-dlp exits cleanly when --max-filesize skips the only format.
-            raise YtDlpError("Видео в этом качестве не помещается в лимит Telegram.")
+            raise YtDlpError("Файл не помещается в лимит Telegram.")
         if path.stat().st_size > limit:
             raise YtDlpError(
                 f"Файл получился {format_size(path.stat().st_size)}, "
-                f"а лимит Telegram {format_size(limit)}. Выберите качество пониже."
+                f"а лимит Telegram {format_size(limit)}."
             )
 
         lines = output.strip().splitlines()
-        metadata = json.loads(lines[-1]) if lines else {}
-        duration = metadata.get("duration")
-        return DownloadedVideo(
-            path=path,
-            width=metadata.get("width"),
-            height=metadata.get("height"),
-            duration=int(duration) if duration else None,
-        )
+        return json.loads(lines[-1]) if lines else {}
+
+
+def _whole_seconds(metadata: dict) -> int | None:
+    duration = metadata.get("duration")
+    return int(duration) if duration else None
 
 
 def format_size(size: int) -> str:

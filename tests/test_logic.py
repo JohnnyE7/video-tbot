@@ -2,9 +2,16 @@ import unittest
 
 from aiogram.types import Chat, Message, MessageEntity
 
-from bot.handlers import build_text, split_caption
+from bot.handlers import audio_filename, build_text, split_caption
 from bot.links import extract_urls, is_supported
-from bot.ytdlp import Quality, YtDlpError, friendly_error, parse_info, parse_qualities
+from bot.ytdlp import (
+    Quality,
+    YtDlpError,
+    friendly_error,
+    parse_audio_size,
+    parse_info,
+    parse_qualities,
+)
 
 
 class LinksTest(unittest.TestCase):
@@ -77,6 +84,19 @@ class QualitiesTest(unittest.TestCase):
         }
         self.assertEqual(parse_qualities(info), (Quality(720, 1_000_000),))
 
+    def test_audio_size_prefers_aac_stream(self):
+        info = {
+            "formats": [
+                {"vcodec": "none", "acodec": "opus", "filesize": 9_000_000, "tbr": 160},
+                {"vcodec": "none", "acodec": "mp4a.40.2", "filesize": 1_000_000, "tbr": 128},
+            ],
+        }
+        self.assertEqual(parse_audio_size(info), 1_000_000)
+
+    def test_audio_size_is_unknown_without_separate_stream(self):
+        info = {"formats": [{"vcodec": "h264", "acodec": "aac", "height": 720, "filesize": 5}]}
+        self.assertIsNone(parse_audio_size(info))
+
     def test_keeps_lowest_resolutions(self):
         heights = (2160, 1440, 1080, 720, 480, 360, 240, 144)
         info = {"formats": [{"vcodec": "h264", "acodec": "aac", "height": h} for h in heights]}
@@ -118,6 +138,14 @@ class TextTest(unittest.TestCase):
         self.assertTrue(all(len(part) <= 2000 for part in parts))
 
 
+class AudioFilenameTest(unittest.TestCase):
+    def test_replaces_forbidden_characters(self):
+        self.assertEqual(audio_filename('AC/DC: "Back"?'), "AC_DC_ _Back__.m4a")
+
+    def test_empty_title_gets_default_name(self):
+        self.assertEqual(audio_filename(" . "), "audio.m4a")
+
+
 class ErrorsTest(unittest.TestCase):
     def test_maps_login_errors(self):
         message = friendly_error("ERROR: [Instagram] abc: login required to view this")
@@ -126,6 +154,12 @@ class ErrorsTest(unittest.TestCase):
     def test_maps_playlist_and_profile_links(self):
         message = friendly_error("ERROR: No suitable extractor found for URL https://x")
         self.assertIn("конкретное видео", message)
+
+    def test_maps_silent_video(self):
+        message = friendly_error(
+            "ERROR: Postprocessing: WARNING: unable to obtain file audio codec with ffprobe"
+        )
+        self.assertEqual(message, "В этом видео нет звука.")
 
     def test_unknown_error_keeps_details(self):
         self.assertIn("boom", friendly_error("WARNING: x\nERROR: boom"))

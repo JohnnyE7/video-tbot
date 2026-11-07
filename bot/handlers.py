@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import re
 import tempfile
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from aiogram import F, Router
@@ -13,6 +15,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
     ReplyParameters,
@@ -47,12 +50,17 @@ class QualityCallback(CallbackData, prefix="quality"):
     height: int
 
 
+class AudioCallback(CallbackData, prefix="audio"):
+    request_id: str
+
+
 @dataclass
 class VideoRequest:
     url: str
     info: VideoInfo
     qualities: tuple[Quality, ...]
     source_message_id: int
+    offer_audio: bool = True
     include_title: bool = True
     include_description: bool = False
     in_progress: bool = False
@@ -81,6 +89,16 @@ def quality_label(quality: Quality) -> str:
     return f"{name} · ~{format_size(quality.size)}" if quality.size else name
 
 
+def audio_label(size: int | None) -> str:
+    return f"🎵 Только аудио · ~{format_size(size)}" if size else "🎵 Только аудио"
+
+
+def audio_filename(title: str) -> str:
+    """Names the saved file after the video, without characters Windows forbids."""
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip(" .")[:100]
+    return f"{name or 'audio'}.m4a"
+
+
 def build_keyboard(request_id: str, request: VideoRequest) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(
@@ -97,6 +115,13 @@ def build_keyboard(request_id: str, request: VideoRequest) -> InlineKeyboardMark
             callback_data=QualityCallback(request_id=request_id, height=quality.height),
         )
     builder.adjust(2)
+    if request.offer_audio:
+        builder.row(
+            InlineKeyboardButton(
+                text=audio_label(request.info.audio_size),
+                callback_data=AudioCallback(request_id=request_id).pack(),
+            )
+        )
     return builder.as_markup()
 
 
@@ -130,7 +155,8 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
         limit = config.upload_limit
         qualities = info.qualities or (Quality(BEST_AVAILABLE, None),)
         fitting = tuple(q for q in qualities if q.size is None or q.size <= limit)
-        if not fitting:
+        offer_audio = info.audio_size is None or info.audio_size <= limit
+        if not fitting and not offer_audio:
             smallest = min(q.size for q in qualities)
             await status.edit_text(
                 f"Видео слишком большое: минимум {format_size(smallest)}, "
@@ -139,22 +165,49 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
             return
 
         request_id = uuid.uuid4().hex[:12]
-        request = VideoRequest(url, info, fitting, source_message_id)
+        request = VideoRequest(url, info, fitting, source_message_id, offer_audio)
         requests[request_id] = request
         while len(requests) > MAX_PENDING_REQUESTS:
             requests.popitem(last=False)
-        await status.edit_text(
-            build_menu_text(info), reply_markup=build_keyboard(request_id, request)
+        text = build_menu_text(info)
+        if not fitting:
+            text = f"Видео не помещается в лимит Telegram, но можно скачать аудио.\n\n{text}"
+        await status.edit_text(text, reply_markup=build_keyboard(request_id, request))
+
+    def caption_parts(request: VideoRequest) -> tuple[str | None, list[str]]:
+        return split_caption(
+            build_text(
+                request.info.title,
+                request.info.description,
+                request.include_title,
+                request.include_description,
+            )
         )
 
+    async def send_audio(status: Message, request: VideoRequest) -> None:
+        caption, extra_messages = caption_parts(request)
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            audio = await ytdlp.download_audio(request.url, Path(directory))
+            await status.edit_text("Отправляю в Telegram…")
+            sent = await status.bot.send_audio(
+                chat_id=status.chat.id,
+                audio=FSInputFile(audio.path, filename=audio_filename(request.info.title)),
+                caption=caption,
+                title=audio.title,
+                performer=audio.performer,
+                duration=audio.duration,
+                reply_parameters=ReplyParameters(
+                    message_id=request.source_message_id,
+                    allow_sending_without_reply=True,
+                ),
+                request_timeout=UPLOAD_TIMEOUT,
+            )
+        for part in extra_messages:
+            await sent.reply(part)
+
     async def send_video(status: Message, request: VideoRequest, height: int) -> None:
-        text = build_text(
-            request.info.title,
-            request.info.description,
-            request.include_title,
-            request.include_description,
-        )
-        caption, extra_messages = split_caption(text)
+        caption, extra_messages = caption_parts(request)
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             video = await ytdlp.download(request.url, height, Path(directory))
@@ -229,7 +282,23 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
 
     @router.callback_query(QualityCallback.filter())
     async def handle_quality(callback: CallbackQuery, callback_data: QualityCallback) -> None:
-        request_id = callback_data.request_id
+        await deliver(
+            callback,
+            callback_data.request_id,
+            "Скачиваю видео…",
+            lambda status, request: send_video(status, request, callback_data.height),
+        )
+
+    @router.callback_query(AudioCallback.filter())
+    async def handle_audio(callback: CallbackQuery, callback_data: AudioCallback) -> None:
+        await deliver(callback, callback_data.request_id, "Скачиваю аудио…", send_audio)
+
+    async def deliver(
+        callback: CallbackQuery,
+        request_id: str,
+        progress_text: str,
+        send: Callable[[Message, VideoRequest], Awaitable[None]],
+    ) -> None:
         request = requests.get(request_id)
         if request is None or not is_allowed(callback.from_user.id):
             await callback.answer("Запрос устарел, пришлите ссылку ещё раз.", show_alert=True)
@@ -244,11 +313,11 @@ def create_router(config: Config, ytdlp: YtDlp) -> Router:
         try:
             await status.edit_text("В очереди…")
             async with download_slots:
-                await status.edit_text("Скачиваю видео…")
-                await send_video(status, request, callback_data.height)
+                await status.edit_text(progress_text)
+                await send(status, request)
         except (YtDlpError, TelegramAPIError) as error:
             logger.warning("Failed to deliver %s: %s", request.url, error)
-            message = str(error) if isinstance(error, YtDlpError) else "Telegram не принял видео."
+            message = str(error) if isinstance(error, YtDlpError) else "Telegram не принял файл."
             await status.edit_text(
                 f"{message}\n\n{build_menu_text(request.info)}",
                 reply_markup=build_keyboard(request_id, request),
