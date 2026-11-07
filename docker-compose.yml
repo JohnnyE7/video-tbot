@@ -3,6 +3,8 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - bot-data:/data
 
   # Started only with --profile big-files: raises the upload limit from 50 MB to 2 GB.
   telegram-bot-api:
@@ -17,4 +19,5 @@ services:
       - telegram-bot-api-data:/var/lib/telegram-bot-api
 
 volumes:
+  bot-data:
   telegram-bot-api-data:
